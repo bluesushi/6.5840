@@ -23,7 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-    "fmt"
+    //"fmt"
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -162,7 +162,6 @@ type AppendEntries struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
     rf.mu.Lock()
-    fmt.Printf("I am %d receiving request from %d\n", rf.me, args.CandidateId)
 
     // we don't need to check if they've voted? only that the current term is larger?
     if rf.role == 'F' && args.Term > rf.currentTerm {
@@ -171,7 +170,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
         
         reply.VoteGranted = true
 
-        fmt.Printf("%d just voted for %d\n", rf.me, rf.votedFor)
         rf.unsafeTicks()
     // DEMOTE IF LATER TERM IS FOUND
     } else if (rf.role == 'C' || rf.role == 'L') && rf.currentTerm < args.Term {
@@ -184,7 +182,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
         reply.VoteGranted = true
 
-        fmt.Printf("%d just voted for %d\n", rf.me, rf.votedFor)
         rf.unsafeTicks()
     } else {
         reply.VoteGranted = false
@@ -250,7 +247,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
         return
     }
     rep := RequestVoteReply{}
-    fmt.Println("vote being sent to", server)
 
 	ok := rf.peers[server].Call("Raft.RequestVote", args, &rep)
 
@@ -262,8 +258,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
             rf.isLeader = true
             // start heartbeats
             // ADD A SYNC ONCE FOR THIS??
-            fmt.Println("starting beats for server: ", rf.me)
-            fmt.Println("votes ", rf.votesRec)
             rf.mu.Unlock() 
             rf.heartbeats()
         } else { // NEED THIS OTHERWISE WHEN LEADER IS DONE RUNNING IT'LL TRY TO UNLOCK AN UNLOCKED LOCK
@@ -381,7 +375,6 @@ func (rf *Raft) startElection() {
     
     req.Term = rf.currentTerm
     req.CandidateId = rf.me
-    fmt.Printf("startElection - server: %v term: %v\n", rf.me, rf.currentTerm)
 
     for i, _ := range rf.peers {
         go rf.sendRequestVote(i, &req)
