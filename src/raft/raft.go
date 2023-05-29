@@ -74,9 +74,17 @@ type Raft struct {
 
 // return currentTerm and whether this server
 // believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
+func (rf *Raft) GetState() (ct int, l bool) {
 	// Your code here (2A).
-	return rf.currentTerm, rf.isLeader
+    // p := make(atomic.Pointer[Raft]) CHECK THIS OUT LATER
+    rf.mu.Lock()
+    
+    ct = rf.currentTerm
+    l = rf.isLeader
+
+    rf.mu.Unlock()
+
+	return
 }
 
 // save Raft's persistent state to stable storage,
@@ -154,22 +162,29 @@ type AppendEntries struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
     rf.mu.Lock()
+    fmt.Printf("I am %d receiving request from %d\n", rf.me, args.CandidateId)
 
-    if rf.role == 'F' && rf.votedFor < 0 && args.Term > rf.currentTerm {
+    // we don't need to check if they've voted? only that the current term is larger?
+    if rf.role == 'F' && args.Term > rf.currentTerm {
         rf.votedFor = args.CandidateId
         rf.currentTerm = args.Term
         
         reply.VoteGranted = true
 
-        fmt.Println("server just voted: ", rf.me)
-        fmt.Println("voted for", rf.votedFor)
+        fmt.Printf("%d just voted for %d\n", rf.me, rf.votedFor)
         rf.unsafeTicks()
+    // DEMOTE IF LATER TERM IS FOUND
     } else if (rf.role == 'C' || rf.role == 'L') && rf.currentTerm < args.Term {
+        rf.role = 'F'
+        rf.isLeader = false
+        rf.votesRec = 1
+
         rf.votedFor = args.CandidateId
         rf.currentTerm = args.Term
 
         reply.VoteGranted = true
 
+        fmt.Printf("%d just voted for %d\n", rf.me, rf.votedFor)
         rf.unsafeTicks()
     } else {
         reply.VoteGranted = false
@@ -181,18 +196,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntry(args *AppendEntries, ignore *AppendEntries) {
     rf.mu.Lock()
     
+
+    // RESTART TICKER FOR LEADER
+    if rf.isLeader && args.Term > rf.currentTerm {
+        rf.isLeader = false
+        rf.role = 'F'
+        rf.unsafeTicks()
+        rf.mu.Unlock()
+        go rf.ticker()
+        return
+    }
+
     // old leader trying to send message
     if args.Term < rf.currentTerm {
         rf.mu.Unlock()
         return 
     }
 
-    rf.role = 'F'
-    rf.votedFor = -1
-    rf.votesRec = 1
-
     rf.unsafeTicks()
-    
+
     rf.mu.Unlock()
 }
 
@@ -228,6 +250,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
         return
     }
     rep := RequestVoteReply{}
+    fmt.Println("vote being sent to", server)
 
 	ok := rf.peers[server].Call("Raft.RequestVote", args, &rep)
 
@@ -241,9 +264,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
             // ADD A SYNC ONCE FOR THIS??
             fmt.Println("starting beats for server: ", rf.me)
             fmt.Println("votes ", rf.votesRec)
+            rf.mu.Unlock() 
             rf.heartbeats()
+        } else { // NEED THIS OTHERWISE WHEN LEADER IS DONE RUNNING IT'LL TRY TO UNLOCK AN UNLOCKED LOCK
+            rf.mu.Unlock()
         }
-        rf.mu.Unlock()
     }
 }
 
@@ -261,10 +286,12 @@ func (rf *Raft) sendBeat(server int, a *AppendEntries) {
 // leader sends heartbeats
 func (rf *Raft) heartbeats() {
     a := AppendEntries{}
+    rf.mu.Lock()
     a.Term = rf.currentTerm
     a.Server = rf.me
+    rf.mu.Unlock()
 
-    for {
+    for _, leader := rf.GetState(); leader; {
         for i, _ := range rf.peers {
             go rf.sendBeat(i, &a)
         }
@@ -275,9 +302,9 @@ func (rf *Raft) heartbeats() {
 
 func majorityNum(a int) int {
     if a % 2 == 0 {
-        return (a / 2) + 1
-    } else {
         return a / 2
+    } else {
+        return a / 2 + 1
     }
 }
 
@@ -326,14 +353,18 @@ func (rf *Raft) killed() bool {
 
 // Use cautiously
 func (rf *Raft) unsafeTicks() {
-    ms := 1000 + (rand.Int63() % 500)
+    ms := 500 + (rand.Int63() % 700)
+    // r := rand.New(rand.NewSource(int64(rf.me * 2)))
+    // ms := 1000 + (r.Int63() % 500)
     rf.ticks = ms / 30
     rf.rem = ms % 30
 }
 
 func (rf *Raft) genTicks() {
     rf.mu.Lock()
-    ms := 1000 + (rand.Int63() % 500)
+    ms := 500 + (rand.Int63() % 700)
+    // r := rand.New(rand.NewSource(int64(rf.me * 2)))
+    // ms := 1000 + (r.Int63() % 500)
     rf.ticks = ms / 30
     rf.rem = ms % 30
     rf.mu.Unlock()
@@ -365,7 +396,8 @@ func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
         rf.mu.Lock()
-        if rf.role == 'L' {
+        if rf.isLeader {
+            rf.mu.Unlock() // this otherwise causes a deadlock
             return // stop timer if we are the leader
         }
 
