@@ -23,7 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	//"fmt"
+	"fmt"
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -158,6 +158,7 @@ type AppendEntries struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+    fmt.Printf("I am %d receiving request from %d\n", rf.me, args.CandidateId)
 
 	// we don't need to check if they've voted? only that the current term is larger?
 	if rf.role == 'F' && args.Term > rf.currentTerm {
@@ -166,6 +167,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		reply.VoteGranted = true
 
+        fmt.Printf("%d just voted for %d\n", rf.me, rf.votedFor)
 		rf.unsafeTicks()
 		// DEMOTE IF LATER TERM IS FOUND
 	} else if (rf.role == 'C' || rf.role == 'L') && rf.currentTerm < args.Term {
@@ -178,6 +180,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 		reply.VoteGranted = true
 
+        fmt.Printf("%d just voted for %d\n", rf.me, rf.votedFor)
 		rf.unsafeTicks()
 	} else {
 		reply.VoteGranted = false
@@ -197,7 +200,7 @@ func (rf *Raft) AppendEntry(args *AppendEntries, res *AppendEntries) {
 		return
 	}
 
-	// old leader trying to send message
+	// old leader trying to send message so we don't generate ticks
 	if args.Term < rf.currentTerm {
         res.Term = rf.currentTerm
 		rf.mu.Unlock()
@@ -280,6 +283,7 @@ func (rf *Raft) sendBeat(server int, a *AppendEntries) {
 
         if res.Term > rf.currentTerm {
             rf.demote(res.Term)
+            go rf.ticker()
         }
 
         rf.mu.Unlock()
@@ -382,6 +386,7 @@ func (rf *Raft) startElection() {
 
 	req.Term = rf.currentTerm
 	req.CandidateId = rf.me
+    fmt.Printf("startElection - server: %v term: %v\n", rf.me, rf.currentTerm)
 
 	for i, _ := range rf.peers {
 		go rf.sendRequestVote(i, &req)
