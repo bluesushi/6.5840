@@ -23,7 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	//"fmt"
+	"fmt"
 
 	//	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -154,31 +154,37 @@ type AppendEntries struct {
 	Server int
 }
 
+func (rf *Raft) demote(term int) {
+    rf.role = 'F'
+    rf.isLeader = false
+    rf.currentTerm = term
+	rf.unsafeTicks()
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
+    fmt.Printf("I am %d receiving request from %d\n", rf.me, args.CandidateId)
 
 	// we don't need to check if they've voted? only that the current term is larger?
-	if rf.role == 'F' && args.Term > rf.currentTerm {
+	if rf.role == 'F' && rf.currentTerm < args.Term {
 		rf.votedFor = args.CandidateId
 		rf.currentTerm = args.Term
 
 		reply.VoteGranted = true
+        reply.Term = args.Term
 
+        fmt.Printf("%d just voted for %d\n", rf.me, rf.votedFor)
 		rf.unsafeTicks()
-		// DEMOTE IF LATER TERM IS FOUND
-	} else if (rf.role == 'C' || rf.role == 'L') && rf.currentTerm < args.Term {
-		rf.role = 'F'
-		rf.isLeader = false
-		rf.votesRec = 1
+	} else if (rf.role == 'C' || rf.role == 'L') && rf.currentTerm < args.Term { // old leader/cand
+        rf.demote(args.Term)
 
 		rf.votedFor = args.CandidateId
-		rf.currentTerm = args.Term
-
 		reply.VoteGranted = true
+        reply.Term = args.Term
 
-		rf.unsafeTicks()
+        fmt.Printf("%d just voted for %d\n", rf.me, rf.votedFor)
 	} else {
 		reply.VoteGranted = false
 	}
@@ -186,24 +192,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) AppendEntry(args *AppendEntries, ignore *AppendEntries) {
+func (rf *Raft) AppendEntry(args *AppendEntries, res *AppendEntries) {
 	rf.mu.Lock()
-
-	// RESTART TICKER FOR LEADER
-	if rf.isLeader && args.Term > rf.currentTerm {
-		rf.isLeader = false
-		rf.role = 'F'
-		rf.unsafeTicks()
-		rf.mu.Unlock()
-		go rf.ticker()
-		return
-	}
 
 	// old leader trying to send message
 	if args.Term < rf.currentTerm {
+        res.Term = rf.currentTerm
 		rf.mu.Unlock()
 		return
-	}
+	} else if rf.isLeader && args.Term > rf.currentTerm {
+        res.Term = args.Term
+        rf.demote(args.Term)
+        rf.mu.Unlock()
+        return
+    }
 
 	rf.unsafeTicks()
 
@@ -237,12 +239,16 @@ func (rf *Raft) AppendEntry(args *AppendEntries, ignore *AppendEntries) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
+// TODO: working on not sending request votes if we've been demoted
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
-	if rf.me == server {
+    rf.mu.Lock()
+	if rf.me == server || rf.role != 'C' {
+        rf.mu.Unlock()
 		return
 	}
+    rf.mu.Unlock()
+    
 	rep := RequestVoteReply{}
-
 	ok := rf.peers[server].Call("Raft.RequestVote", args, &rep)
 
 	if ok && rep.VoteGranted {
@@ -258,7 +264,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
 		} else { // NEED THIS OTHERWISE WHEN LEADER IS DONE RUNNING IT'LL TRY TO UNLOCK AN UNLOCKED LOCK
 			rf.mu.Unlock()
 		}
-	}
+	} 
 }
 
 func (rf *Raft) sendBeat(server int, a *AppendEntries) {
@@ -266,9 +272,18 @@ func (rf *Raft) sendBeat(server int, a *AppendEntries) {
 		return
 	}
 
-	b := AppendEntries{}
+	res := AppendEntries{}
 
-	rf.peers[server].Call("Raft.AppendEntry", a, &b)
+    ok := rf.peers[server].Call("Raft.AppendEntry", a, &res)
+    if ok {
+        rf.mu.Lock()
+        
+        if res.Term > rf.currentTerm {
+            rf.demote(res.Term)
+        }
+
+        rf.mu.Unlock()
+    }
 }
 
 // leader sends heartbeats
@@ -288,8 +303,9 @@ func (rf *Raft) heartbeats() {
 	}
 }
 
+// TODO
 func majorityNum(a int) int {
-	if a%2 == 0 {
+	if a % 2 == 0 {
 		return a / 2
 	} else {
 		return a/2 + 1
@@ -340,8 +356,6 @@ func (rf *Raft) killed() bool {
 // Use cautiously
 func (rf *Raft) unsafeTicks() {
 	ms := 500 + (rand.Int63() % 700)
-	// r := rand.New(rand.NewSource(int64(rf.me * 2)))
-	// ms := 1000 + (r.Int63() % 500)
 	rf.ticks = ms / 30
 	rf.rem = ms % 30
 }
@@ -349,8 +363,6 @@ func (rf *Raft) unsafeTicks() {
 func (rf *Raft) genTicks() {
 	rf.mu.Lock()
 	ms := 500 + (rand.Int63() % 700)
-	// r := rand.New(rand.NewSource(int64(rf.me * 2)))
-	// ms := 1000 + (r.Int63() % 500)
 	rf.ticks = ms / 30
 	rf.rem = ms % 30
 	rf.mu.Unlock()
@@ -367,6 +379,8 @@ func (rf *Raft) startElection() {
 
 	req.Term = rf.currentTerm
 	req.CandidateId = rf.me
+
+    fmt.Printf("startElection - server: %v term: %v\n", rf.me, rf.currentTerm)
 
 	for i, _ := range rf.peers {
 		go rf.sendRequestVote(i, &req)
