@@ -166,23 +166,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 
 		reply.VoteGranted = true
+        reply.Term = args.Term
 
         fmt.Printf("%d just voted for %d\n", rf.me, rf.votedFor)
 		rf.unsafeTicks()
-		// DEMOTE IF LATER TERM IS FOUND
+	// DEMOTE IF LATER TERM IS FOUND
 	} else if (rf.role == 'C' || rf.role == 'L') && rf.currentTerm < args.Term {
-		rf.role = 'F'
-		rf.isLeader = false
-		rf.votesRec = 1
+        rf.demote(args.Term)
 
 		rf.votedFor = args.CandidateId
-		rf.currentTerm = args.Term
-
 		reply.VoteGranted = true
+        reply.Term = args.Term
 
         fmt.Printf("%d just voted for %d\n", rf.me, rf.votedFor)
-		rf.unsafeTicks()
 	} else {
+        reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 	}
 
@@ -198,10 +196,7 @@ func (rf *Raft) AppendEntry(args *AppendEntries, res *AppendEntries) {
 		rf.mu.Unlock()
 		go rf.ticker()
 		return
-	}
-
-	// old leader trying to send message so we don't generate ticks
-	if args.Term < rf.currentTerm {
+	} else if args.Term < rf.currentTerm { // old leader trying to send message so we don't generate ticks
         res.Term = rf.currentTerm
 		rf.mu.Unlock()
 		return
@@ -240,11 +235,14 @@ func (rf *Raft) AppendEntry(args *AppendEntries, res *AppendEntries) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
-	if rf.me == server {
+    rf.mu.Lock()
+	if rf.me == server || rf.role != 'C' {
+        rf.mu.Unlock()
 		return
 	}
-	rep := RequestVoteReply{}
+    rf.mu.Unlock()
 
+	rep := RequestVoteReply{}
 	ok := rf.peers[server].Call("Raft.RequestVote", args, &rep)
 
 	if ok && rep.VoteGranted {
@@ -256,11 +254,20 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs) {
 			// start heartbeats
 			// ADD A SYNC ONCE FOR THIS??
 			rf.mu.Unlock()
+            fmt.Println("starting beats for", rf.me)
 			rf.heartbeats()
-		} else { // NEED THIS OTHERWISE WHEN LEADER IS DONE RUNNING IT'LL TRY TO UNLOCK AN UNLOCKED LOCK
+		} else {
 			rf.mu.Unlock()
 		}
-	}
+	} else if ok {
+        rf.mu.Lock()
+
+        if rep.Term > rf.currentTerm {
+            rf.demote(rep.Term)
+        }
+
+        rf.mu.Unlock()
+    }
 }
 
 func (rf *Raft) demote(term int) {
@@ -271,9 +278,12 @@ func (rf *Raft) demote(term int) {
 }
 
 func (rf *Raft) sendBeat(server int, a *AppendEntries) {
-	if rf.me == server {
+    rf.mu.Lock()
+	if rf.me == server || !rf.isLeader {
+        rf.mu.Unlock()
 		return
 	}
+    rf.mu.Unlock()
 
     res := AppendEntries{}
 
@@ -307,8 +317,9 @@ func (rf *Raft) heartbeats() {
 	}
 }
 
+// TODO
 func majorityNum(a int) int {
-	if a%2 == 0 {
+	if a % 2 == 0 {
 		return a / 2
 	} else {
 		return a/2 + 1
