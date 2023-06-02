@@ -29,6 +29,13 @@ import (
 	"6.5840/labrpc"
 )
 
+func min(a, b int) int {
+    if a < b {
+        return a
+    }
+    return b
+}
+
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make(). set
@@ -69,6 +76,17 @@ type Raft struct {
 	role        int32
 	phase       int32
 	votesRec    int
+
+    // 2B
+    applyCh     chan ApplyMsg
+    log         []LogEntry // max log size is 2k according to tester
+    commitIndex int
+    lastApplied int
+    // used by leaders only
+    nextIndex   []int
+    matchIndex  []int
+    appended    *atomic.Int32
+    index       int
 }
 
 // return currentTerm and whether this server
@@ -150,8 +168,25 @@ type RequestVoteReply struct {
 }
 
 type AppendEntries struct {
+    // 2A
 	Term   int
 	Server int
+
+    // 2B
+    PrevLogIndex int
+    PrevLogTerm  int
+    Entry        LogEntry
+    LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+    Term int
+    Success bool
+}
+
+type LogEntry struct {
+    Term int
+    Command interface{} 
 }
 
 // example RequestVote RPC handler.
@@ -187,25 +222,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Unlock()
 }
 
-func (rf *Raft) AppendEntry(args *AppendEntries, res *AppendEntries) {
-	rf.mu.Lock()
-
-	// RESTART TICKER FOR LEADER
-	if rf.isLeader && args.Term > rf.currentTerm {
-        rf.demote(args.Term)
-		rf.mu.Unlock()
-		go rf.ticker()
-		return
-	} else if args.Term < rf.currentTerm { // old leader trying to send message so we don't generate ticks
-        res.Term = rf.currentTerm
-		rf.mu.Unlock()
-		return
-	}
-
-	rf.unsafeTicks()
-
-	rf.mu.Unlock()
-}
 
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -283,9 +299,10 @@ func (rf *Raft) sendBeat(server int, a *AppendEntries) {
         rf.mu.Unlock()
 		return
 	}
+    a.LeaderCommit = rf.commitIndex // awkward to set commit index here
     rf.mu.Unlock()
 
-    res := AppendEntries{}
+    res := AppendEntriesReply{}
 
     ok := rf.peers[server].Call("Raft.AppendEntry", a, &res)
     if ok {
@@ -326,6 +343,83 @@ func majorityNum(a int) int {
 	}
 }
 
+func (rf *Raft) AppendEntry(args *AppendEntries, res *AppendEntriesReply) {
+	rf.mu.Lock()
+
+	// RESTART TICKER FOR LEADER
+	if rf.isLeader && args.Term > rf.currentTerm {
+        rf.demote(args.Term)
+		go rf.ticker()
+	} else if args.Term < rf.currentTerm { // old leader trying to send message so we don't generate ticks
+        res.Term = rf.currentTerm
+        res.Success = false
+	} else if args.Entry.Term == 0 { // heartbeat
+        if args.LeaderCommit > rf.commitIndex { // edge-case where no entries have been committed?
+            rf.commitIndex = min(args.LeaderCommit, rf.index)
+            rf.applyCh <- ApplyMsg{ CommandValid: true, Command: rf.log[rf.commitIndex].Command,
+                                    CommandIndex: rf.commitIndex } 
+        }
+        rf.unsafeTicks()
+        res.Term = args.Term
+    } else {
+        if rf.index == args.PrevLogIndex && rf.log[args.PrevLogIndex].Term == args.PrevLogTerm {
+            rf.index++
+            rf.log[rf.index] = args.Entry
+            res.Success = true
+        } else {
+            res.Success = false
+        }
+	    rf.unsafeTicks()
+    }
+
+	rf.mu.Unlock()
+}
+
+func (rf *Raft) newEntry(peer *labrpc.ClientEnd, args *AppendEntries) {
+    res := AppendEntriesReply{}
+
+    ok := peer.Call("Raft.AppendEntry", args, &res)
+    // this is where we commit
+    rf.mu.Lock()
+    if ok && res.Success && int(rf.appended.Add(1)) == majorityNum(len(rf.peers)) { // demorgans
+        rf.commitIndex = rf.index                 
+        rf.applyCh <- ApplyMsg{ CommandValid: true, Command: rf.log[rf.commitIndex].Command,
+                                CommandIndex: rf.commitIndex } 
+    }
+    rf.mu.Unlock()
+}
+
+func (rf *Raft) replicate(server int, command interface{}) {
+    rf.mu.Lock()
+    args := AppendEntries{
+        Term: rf.currentTerm,
+        Server: rf.me,
+        Entry: LogEntry{
+            Term: rf.currentTerm,
+            Command: command,
+        },
+        LeaderCommit: rf.commitIndex,
+    }
+
+    if len(rf.log) == 0 {
+        args.PrevLogIndex = 0
+        args.PrevLogTerm = 0
+    } else {
+        args.PrevLogIndex = rf.index
+        args.PrevLogTerm = rf.log[rf.index].Term
+    }
+    rf.index++
+    rf.log[rf.index] = args.Entry
+    rf.appended.Store(1)
+    rf.mu.Unlock()
+    
+    for i := range rf.peers {
+        if i != server {
+            go rf.newEntry(rf.peers[i], &args)
+        }
+    }
+}
+
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -339,13 +433,17 @@ func majorityNum(a int) int {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+    rf.mu.Lock() 
 
-	// Your code here (2B).
+    if rf.isLeader {
+        rf.mu.Unlock()
+        go rf.replicate(rf.me, command)
+        return rf.index + 1, rf.currentTerm, true
+    }
 
-	return index, term, isLeader
+    curr := rf.currentTerm
+    rf.mu.Unlock()
+	return -1, curr, false
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -370,8 +468,6 @@ func (rf *Raft) killed() bool {
 // Use cautiously
 func (rf *Raft) unsafeTicks() {
 	ms := 500 + (rand.Int63() % 700)
-	// r := rand.New(rand.NewSource(int64(rf.me * 2)))
-	// ms := 1000 + (r.Int63() % 500)
 	rf.ticks = ms / 30
 	rf.rem = ms % 30
 }
@@ -379,8 +475,6 @@ func (rf *Raft) unsafeTicks() {
 func (rf *Raft) genTicks() {
 	rf.mu.Lock()
 	ms := 500 + (rand.Int63() % 700)
-	// r := rand.New(rand.NewSource(int64(rf.me * 2)))
-	// ms := 1000 + (r.Int63() % 500)
 	rf.ticks = ms / 30
 	rf.rem = ms % 30
 	rf.mu.Unlock()
@@ -457,6 +551,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.role = 'F'
 	rf.votedFor = -1
 	rf.votesRec = 1 // always vote for self
+
+    // 2B
+    rf.applyCh = applyCh
+    rf.commitIndex = 0
+    rf.index = 0
+    rf.lastApplied = 0
+    rf.log = make([]LogEntry, 20)
+    rf.log[0] = LogEntry{ Term: 0, Command: nil }
+    rf.nextIndex = make([]int, len(peers))
+    rf.matchIndex = make([]int, len(peers))
+    rf.appended = &atomic.Int32{}
+    rf.appended.Store(1)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
